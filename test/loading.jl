@@ -2038,6 +2038,81 @@ end
     end
 end
 
+# with an instrumented system image, path coverage cannot use plain caches
+@testset "path coverage uses plain caches without code from the tracked path" begin
+    Base.match_cache_coverage(Base.CacheFlags(coverage=0), Base.CacheFlags(coverage=1)) && return
+    mkdepottempdir() do depot
+        # tracked paths are compared as resolved, and macOS temp dirs sit behind a symlink
+        pkgs = joinpath(realpath(depot), "pkgs")
+        depdir = joinpath(pkgs, "CovDep")
+        topdir = joinpath(pkgs, "CovTop")
+        mkpath(joinpath(depdir, "src"))
+        mkpath(joinpath(topdir, "src"))
+        write(joinpath(depdir, "Project.toml"), """
+            name = "CovDep"
+            uuid = "7d5e6c1a-3f0b-4e8e-9d6c-1a2b3c4d5e6f"
+            version = "0.1.0"
+
+            [deps]
+            Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+            """)
+        write(joinpath(depdir, "src", "CovDep.jl"), """
+            module CovDep
+            using Printf
+            f(x) = @sprintf("%d", x)
+            end
+            """)
+        write(joinpath(topdir, "Project.toml"), """
+            name = "CovTop"
+            uuid = "0b9d4d0e-6a43-4c86-9d2b-3c8e1f7a5b42"
+            version = "0.1.0"
+
+            [deps]
+            CovDep = "7d5e6c1a-3f0b-4e8e-9d6c-1a2b3c4d5e6f"
+            """)
+        write(joinpath(topdir, "src", "CovTop.jl"), """
+            module CovTop
+            using CovDep
+            g(x) = CovDep.f(x)
+            precompile(g, (Int,))
+            end
+            """)
+        compiled = joinpath(depot, "compiled", "v$(VERSION.major).$(VERSION.minor)")
+        sep = Sys.iswindows() ? ';' : ':'
+        # the trailing separator keeps the bundled stdlib caches on the depot path
+        env = ("JULIA_DEPOT_PATH" => depot * sep, "JULIA_LOAD_PATH" => pkgs * sep * "@stdlib")
+        exename = Base.julia_cmd()[1]
+        covcmd(cov, code) = addenv(`$exename --startup-file=no --pkgimages=yes $cov -e $code`, env...)
+        ncaches(pkg) = count(endswith(".ji"), readdir(joinpath(compiled, pkg)))
+
+        @test success(covcmd(`--code-coverage=none`, "using CovTop"))
+        @test ncaches("CovDep") == ncaches("CovTop") == 1
+        # restoring a plain cache directly, bypassing the loader's checks, needs its approval
+        plaindep = only(filter(endswith(".ji"), readdir(joinpath(compiled, "CovDep"), join=true)))
+        restore = """
+            pkg = Base.identify_package("CovDep")
+            path = $(repr(plaindep))
+            r = @lock Base.require_lock Base._tryrequire_from_serialized(pkg, path, Base.ocachefile_from_cachefile(path))
+            exit(r isa Module ? 0 : occursin("coverage", sprint(showerror, r)) ? 2 : 1)
+            """
+        @test success(covcmd(`--code-coverage=none`, restore))
+        p = run(ignorestatus(covcmd(`--code-coverage=@$depdir`, restore)))
+        @test p.exitcode == 2
+        # tracking another path keeps using the plain caches
+        @test success(covcmd(`--code-coverage=@$(joinpath(depot, "elsewhere"))`, "using CovTop"))
+        @test ncaches("CovDep") == ncaches("CovTop") == 1
+        # tracking a dependency instruments it and its dependents, but not the bundled Printf
+        @test success(covcmd(`--code-coverage=@$depdir`, "using CovTop; CovTop.g(1)"))
+        @test ncaches("CovDep") == ncaches("CovTop") == 2
+        @test !isdir(joinpath(compiled, "Printf"))
+        cov = filter(endswith(".cov"), readdir(joinpath(depdir, "src"), join=true))
+        @test occursin(r"^\s+1 f\(x\)"m, read(only(cov), String))
+        # code from the system image's sources can be part of any cache
+        @test success(covcmd(`--code-coverage=@$(joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia", "base"))`, "using Printf"))
+        @test isdir(joinpath(compiled, "Printf"))
+    end
+end
+
 @testset "command-line flags" begin
     mkdepottempdir() do depot_path mktempdir() do dir
         # generate a Parent.jl and Child.jl package, with Parent depending on Child

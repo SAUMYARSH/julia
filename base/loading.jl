@@ -1968,16 +1968,62 @@ function translate_cache_flags(cacheflags::CacheFlags, defaultflags::CacheFlags)
     return opts
 end
 
-# Image instrumentation is independent of the collecting process's scope.
+# Image instrumentation is independent of the collecting process's scope, but a
+# tracked path is kept so that workers accept the same plain dependency images.
 function coverage_cache_options(cf::CacheFlags)
     cf.coverage == 0 && return ["--code-coverage=none"]
     mode = cf.coverage == 2 ? "count" : "hit"
-    return ["--code-coverage=user", "--code-coverage-mode=" * mode]
+    opts = JLOptions()
+    scope = opts.code_coverage == 3 ? "@" * unsafe_string(opts.tracked_path) : "user"
+    return ["--code-coverage=" * scope, "--code-coverage-mode=" * mode]
 end
 
 # Whether a cache with instrumentation `actual` serves `requested`.
 function match_cache_coverage(requested::CacheFlags, actual::CacheFlags)
     return @ccall(jl_match_cache_coverage(UInt8(requested.coverage)::UInt8, UInt8(actual.coverage)::UInt8)::Cint) != 0
+end
+
+# Path coverage can use a plain cache whose own sources, dependencies (pinned by build
+# id and checked the same way), and system image sources are all untracked. Source
+# locations naming other files, e.g. through `include_string`, are not checked.
+function can_use_plain_coverage_cache(requested::CacheFlags, actual::CacheFlags)
+    return requested.coverage != 0 && actual.coverage == 0 &&
+           @ccall(jl_coverage_accepts_plain_images()::Cint) != 0 &&
+           !tracked_path_overlaps_sysimage()
+end
+
+# The runtime only loads plain caches that were accepted for path coverage.
+accept_plain_coverage_cache(build_id::UInt128) =
+    @ccall jl_coverage_accept_plain_image(((build_id >> 64) % UInt64)::UInt64, (build_id % UInt64)::UInt64)::Cvoid
+plain_coverage_cache_accepted(build_id::UInt128) =
+    @ccall(jl_coverage_plain_image_accepted(((build_id >> 64) % UInt64)::UInt64, (build_id % UInt64)::UInt64)::Cint) != 0
+
+function tracked_path_overlaps(dir::String)
+    is_file_tracked(Symbol(dir)) && return true
+    tracked = unsafe_string(JLOptions().tracked_path)
+    return startswith(joinpath(tracked, ""), joinpath(dir, ""))
+end
+
+# Whether the tracked path covers sources of the system image, whose code package
+# images can inline. Base and the Compiler name their files relative to the installed
+# sources, other modules as they were included.
+const tracked_path_overlaps_sysimage = OncePerProcess{Bool}() do
+    datadir = abspath(Sys.BINDIR, DATAROOTDIR, "julia")
+    for dir in (joinpath(datadir, "base"), joinpath(datadir, "Compiler"))
+        tracked_path_overlaps(dir) && return true
+        ispath(dir) && tracked_path_overlaps(realpath(dir)) && return true
+    end
+    included = Set{String}()
+    for (_, file) in _included_files
+        is_file_tracked(Symbol(file)) && return true
+        push!(included, file)
+    end
+    # packages of system images that did not record their files cannot be checked
+    return any(_sysimage_modules) do pkg
+        pkg.uuid === nothing && return false # Base, Core and Main
+        origin = get(pkgorigins, pkg, nothing)
+        return origin === nothing || origin.path ∉ included
+    end
 end
 
 function show(io::IO, cf::CacheFlags)
@@ -4904,8 +4950,9 @@ end
         # one should be cheap.
         header_start = position(io)
         actual_flags = CacheFlags(read(io, UInt8), read(io, UInt8))
+        coverage_mismatch = !match_cache_coverage(requested_flags, actual_flags)
         if @ccall(jl_match_cache_flags(_cacheflag_to_uint8(requested_flags)::UInt8, _cacheflag_to_uint8(actual_flags)::UInt8)::UInt8) == 0 ||
-           !match_cache_coverage(requested_flags, actual_flags)
+           (coverage_mismatch && !can_use_plain_coverage_cache(requested_flags, actual_flags))
             @debug """
             Rejecting cache file $cachefile for $modkey since the flags are mismatched
               requested flags: $(requested_flags) [$(_cacheflag_to_uint8(requested_flags))]
@@ -4918,6 +4965,16 @@ end
         modules, (includes, _, requires), required_modules, srctextpos, prefs_blob, clone_targets, _, syntax_version = parse_cache_header(io, cachefile)
         if isempty(modules)
             return true # ignore empty file
+        end
+        if coverage_mismatch
+            for inc in includes
+                # an unresolved `@depot` path cannot be checked
+                if startswith(inc.filename, "@depot") || is_file_tracked(Symbol(inc.filename))
+                    @debug "Rejecting cache file $cachefile for $modkey since it lacks coverage counters for $(inc.filename)"
+                    record_reason(reasons, :flags_mismatch)
+                    return true
+                end
+            end
         end
         if stalecheck && syntax_version != cache_edition(modspec.julia_edition)
             @debug "Rejecting cache file $cachefile for $modkey since it was parsed for a different Julia syntax version"
@@ -5011,6 +5068,18 @@ end
             depmods[i] = (spec, req_key, req_build_id)
         end
 
+        # dependencies that are already loaded must be plain caches accepted the same way
+        if coverage_mismatch
+            for i in 1:ndeps
+                req_key, req_build_id = required_modules[i]
+                if depmods[i] isa Module && !in_sysimage(req_key) && !plain_coverage_cache_accepted(req_build_id)
+                    @debug "Rejecting cache file $cachefile for $modkey since dependency $req_key may lack coverage counters"
+                    record_reason(reasons, :flags_mismatch)
+                    return true
+                end
+            end
+        end
+
         # check if this file is going to provide one of our concrete dependencies
         # or if it provides a version that conflicts with our concrete dependencies
         # or neither. This is not skipped for a trusted (driver-validated) file:
@@ -5067,6 +5136,7 @@ end
             return true
         end
 
+        coverage_mismatch && accept_plain_coverage_cache(id_build)
         return depmods, ocachefile, id_build # fresh cachefile
     finally
         close(io)
